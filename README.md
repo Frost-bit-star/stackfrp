@@ -38,7 +38,13 @@ The device always starts the connection. No public IP, incoming port, Redis, dat
 For a real app, use the Stackedge CLI:
 
 ```sh
-stackedge start myapp --port 3000 -- npm start
+stackedge start myapp --port 3000 --vercel -- npm start
+```
+
+Or add Vercel to an app that is already running locally:
+
+```sh
+stackedge start myapp --port 3000 --local -- npm start
 stackedge vercel init myapp
 ```
 
