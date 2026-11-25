@@ -53,7 +53,7 @@ stackedge vercel init myapp
 Deploy this folder to Vercel:
 
 ```text
-~/.stackedge/vercel/myapp/project
+<your-project>/stackedge-vercel
 ```
 
 Then finish the setup:
