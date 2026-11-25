@@ -1,17 +1,14 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("http");
-const WebSocket = require("ws");
-const { once } = require("node:events");
 
 process.env.STACKEDGE_FRPS_SERVICE_ID = "svc_vercel_entry";
 process.env.STACKEDGE_FRPS_TOKEN = "vercel-entry-token";
 process.env.STACKEDGE_FRPS_APP = "demo";
 
 const server = require("../api/gateway");
-const { encodeJson, decodeFrame, register } = require("../lib/shared/protocol");
 
-test("Vercel entrypoint exports an HTTP server that accepts FRPC upgrades", async t => {
+test("Vercel entrypoint exports an HTTP server with pull endpoints", async t => {
   assert.ok(server instanceof http.Server);
 
   await new Promise((resolve, reject) => {
@@ -22,15 +19,19 @@ test("Vercel entrypoint exports an HTTP server that accepts FRPC upgrades", asyn
   t.after(() => new Promise(resolve => server.close(resolve)));
 
   const port = server.address().port;
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/_frpc`);
-  await once(ws, "open");
+  const health = await fetch(`http://127.0.0.1:${port}/_health`).then(r => r.json());
+  assert.equal(health.status, "ok");
+  assert.equal(health.mode, "pull");
+  assert.equal(health.serviceId, "svc_vercel_entry");
 
-  ws.send(encodeJson(register("svc_vercel_entry", "vercel-entry-token", "demo")));
-  const [data] = await once(ws, "message");
-  const frame = decodeFrame(data);
+  const verify = await fetch(`http://127.0.0.1:${port}/_verify`, {
+    headers: { "x-stackfrp-token": "vercel-entry-token" }
+  }).then(r => r.json());
+  assert.equal(verify.status, "verified");
 
-  assert.equal(frame.message.type, "registered");
-  assert.equal(frame.message.serviceId, "svc_vercel_entry");
-
-  ws.close();
+  const poll = await fetch(`http://127.0.0.1:${port}/_frpc/poll?wait=200`, {
+    headers: { "x-stackfrp-token": "vercel-entry-token" }
+  }).then(r => r.json());
+  assert.equal(poll.type, "heartbeat");
+  assert.ok(poll.instanceId);
 });

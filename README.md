@@ -15,7 +15,7 @@ The Vercel gateway for Stackedge apps.
 
 </div>
 
-stackfrp gives a local Stackedge app a public URL without opening a port on the device. The app runs on the user's machine. Stackedge connects out to Vercel over WebSocket. Requests from visitors travel back through that connection.
+stackfrp gives a local Stackedge app a public URL without opening a port on the device. The app runs on the user's machine. The Stackedge CLI starts FRPC workers that pull requests from the gateway, then POST responses back. Requests and responses pass through a short-lived Redis mailbox, so Vercel can route public requests to any Function instance.
 
 The CLI and tunnel client live in [stackedge](https://github.com/Frost-bit-star/stackedge). This repo is the gateway that runs on Vercel or any long-lived Node host.
 
@@ -27,13 +27,13 @@ The Vercel button imports this repo as a starter. It deploys the gateway code, b
 Visitor
   ↓ HTTPS
 Vercel gateway (stackfrp)
-  ↓ authenticated WebSocket tunnel
-Stackedge on the device
+  ↓ Redis request/result mailbox
+Stackedge FRPC workers on the device
   ↓ local HTTP through the security proxy
 User app
 ```
 
-The device always starts the connection. No public IP, incoming port, Redis, database, or central server is needed.
+The device always starts the workers. No public IP or incoming port is needed. Redis is needed for reliable Vercel routing because public requests and worker polls can land on different Function instances. A free user-owned Redis database is enough.
 
 ## Quick start
 
@@ -56,7 +56,7 @@ Deploy this folder to Vercel:
 <your-project>/stackedge-vercel
 ```
 
-Then finish the setup:
+Finish the setup:
 
 ```sh
 stackedge vercel deploy myapp https://myapp.vercel.app
@@ -70,9 +70,11 @@ stackedge vercel connect myapp
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /_health` | Deployment status, app name, service ID, and tunnel state |
+| `GET /_health` | Deployment status, app name, service ID, tunnel state, relay backend, and mode |
 | `GET /_verify` | Checks the bearer token from `x-stackfrp-token` |
-| `WS /_frpc` | FRPC registration endpoint |
+| `GET /_frpc/hello` | Authenticated worker handshake that registers presence |
+| `GET /_frpc/poll` | Authenticated long poll for FRPC workers |
+| `POST /_frpc/result` | Authenticated result submission from FRPC workers |
 | `/*` | Relay to the connected Stackedge app |
 
 Example health response:
@@ -82,7 +84,10 @@ Example health response:
   "status": "ok",
   "serviceId": "svc_...",
   "application": "myapp",
-  "tunnel": "connected"
+  "tunnel": "connected",
+  "relay": "redis",
+  "shared": "enabled",
+  "mode": "pull"
 }
 ```
 
@@ -117,16 +122,46 @@ For local use, start from `config.example.json`:
 cp config.example.json config.json
 ```
 
+## Redis mailbox
+
+Set one of these standard Redis URLs on the Vercel project:
+
+- `REDIS_URL`
+- `REDIS_CONNECTION_STRING`
+- `STACKEDGE_REDIS_URL`
+
+Upstash REST credentials are also supported:
+
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
+
+`KV_REST_API_URL` and `KV_REST_API_TOKEN` are accepted as aliases. `REDIS_URL` takes priority over Upstash REST. If neither is set, the gateway falls back to an in-memory mailbox for local development only.
+
+The gateway uses these short-lived keys:
+
+```text
+stackedge:frp:tunnel:<serviceId>
+stackedge:frp:queue:<serviceId>
+stackedge:frp:result:<serviceId>:<requestId>
+```
+
+`stackedge vercel probe myapp` reports `routing: pull-redis` when Redis is active, `routing: pull-memory` for local-only in-memory mode, and `routing: legacy` for an outdated deployment that must be redeployed.
+
 ## Vercel behavior
 
-`api/gateway.js` exports a Node HTTP server, so Vercel can upgrade `/_frpc` WebSockets with Fluid compute. New Vercel projects have Fluid compute enabled by default; older projects must enable it in Functions settings. `vercel.json` sets `maxDuration: 300`, which is the Hobby limit.
+`api/gateway.js` exports a Node HTTP server. Fluid compute is recommended so `/_frpc/poll` can stay open for up to 20 seconds. `vercel.json` sets `maxDuration: 300`, which is the Hobby limit.
 
-A WebSocket connection stays pinned to the instance that accepted it, and FRPC reconnects when Vercel closes it. Public HTTP requests are not guaranteed to reach that same instance, so `stackedge vercel probe myapp` still matters:
+FRPC starts six HTTP poll workers by default. A poll returns either a queued request or a heartbeat. Workers touch the presence key on every poll. Public requests fail fast with `522` when no worker has touched presence recently.
 
-- `same-instance`: routing works.
-- `cross-instance`: public requests cannot reach the in-memory tunnel.
+Redis keys expire automatically. Requests wait up to 30 seconds for a result. Shared bodies are capped at 6 MiB; the local gateway body limit is 16 MiB by default.
 
-For guaranteed routing, run `server.js` on a long-lived Node host, or add a shared store so all instances can reach the tunnel state.
+## Trade-offs
+
+- **No Redis configured:** the gateway uses `memory`. This is fine locally and keeps setup free, but it is not reliable on Vercel because public requests and worker polls can land on different instances. Probe reports `pull-memory`.
+- **Redis configured:** requests work across Vercel instances. The trade-off is one user-owned free Redis database, an extra network hop for each request, 6 MiB shared bodies, and up to a 20 second poll window before a worker receives work.
+- **WebSocket tunnel:** rejected for Vercel because the socket is pinned to one Function instance and cookies do not control Vercel instance affinity. It can still work on a long-lived Node host.
+- **Vercel Blob mailbox:** rejected for this default setup because Blob has per-month operation limits and higher latency than Redis. It remains a possible Redis-free fallback for very low traffic.
+- **Fluid compute:** recommended but not a routing guarantee. Long polls need time to stay open; the mailbox is what makes cross-instance routing work.
 
 ## Error page
 
@@ -136,31 +171,31 @@ Error codes used by the gateway:
 
 | Code | Meaning |
 | --- | --- |
-| `522` | No FRPC tunnel connected |
+| `522` | No FRPC worker connected |
 | `504` | Tunnel request timed out |
-| `503` | Payload too large or tunnel backpressure |
+| `503` | Payload too large |
 | `502` | Relay failed |
 | `413` | Request body too large |
-| `501` | WebSocket upgrade not supported by the runtime |
 | `500` | Config missing |
 
 ## Protocol
 
-The tunnel uses three frame types:
+Vercel mode uses JSON over HTTP:
 
-| Byte | Frame |
-| --- | --- |
-| `1` | JSON control message |
-| `2` | Request body |
-| `3` | Response body |
+1. FRPC workers call `GET /_frpc/poll` with the bearer token.
+2. The gateway queues a public request and one worker receives it.
+3. FRPC forwards the request to the local Stackedge security proxy.
+4. FRPC calls `POST /_frpc/result` with status, headers, and base64 body.
+5. The gateway returns that result to the visitor.
 
-JSON messages handle `register`, `registered`, `heartbeat`, `request`, `response`, `cancel`, and `error`. Body frames contain the type byte, a 16-byte request ID, then the body.
+The older binary frame protocol remains in `lib/shared/protocol.js` and `lib/frps/connection-manager.js` for long-lived WebSocket gateways. Vercel deployments no longer use WebSocket registration.
 
 Limits:
 
 - Request timeout: 30 seconds.
-- Max body size: 16 MiB by default.
-- Duplicate request IDs are rejected.
+- Poll wait: 100 to 20000 milliseconds.
+- Shared body size: 6 MiB.
+- Presence TTL: 60 seconds.
 
 ## Project layout
 
@@ -169,9 +204,8 @@ api/gateway.js              Vercel entry point
 server.js                   Long-lived Node entry point
 lib/config.js               Reads config.json and env overrides
 lib/error-page.js           Branded error page renderer
-lib/frps/server.js          HTTP handler and WebSocket registration
-lib/frps/connection-manager.js  Request/response relay
-lib/shared/protocol.js      Frame encoding and decoding
+lib/frps/server.js          HTTP handler, pull endpoints, and public relay
+lib/frps/shared-state.js    Redis/REST/memory mailbox
 lib/shared/auth.js          Token comparison
 ```
 

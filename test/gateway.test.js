@@ -1,16 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("http");
-const WebSocket = require("ws");
 const { createGateway } = require("../lib/frps/server");
-const {
-  FRAME_REQUEST_BODY,
-  FRAME_RESPONSE_BODY,
-  decodeFrame,
-  encodeBody,
-  encodeJson,
-  register
-} = require("../lib/shared/protocol");
 
 function listen(server, port = 0) {
   return new Promise((resolve, reject) => {
@@ -19,90 +10,73 @@ function listen(server, port = 0) {
   });
 }
 
-function waitFor(emitter, event, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${event}`)), timeoutMs);
-    emitter.once(event, (...args) => {
-      clearTimeout(timer);
-      resolve(args);
-    });
-  });
+function closeServer(server) {
+  return new Promise(resolve => server.close(resolve));
 }
 
-function nextFrame(socket, predicate, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      socket.off("message", onMessage);
-      reject(new Error("Timed out waiting for frame"));
-    }, timeoutMs);
-    function onMessage(data) {
-      const frame = decodeFrame(data);
-      if (!predicate(frame)) return;
-      clearTimeout(timer);
-      socket.off("message", onMessage);
-      resolve(frame);
-    }
-    socket.on("message", onMessage);
+async function pollOnce(port, token, wait = 5000) {
+  const response = await fetch(`http://127.0.0.1:${port}/_frpc/poll?wait=${wait}`, {
+    headers: { "x-stackfrp-token": token }
   });
+  return response.json();
 }
 
-test("Vercel gateway relays a request over an authenticated tunnel", async t => {
+async function submit(port, token, requestId, result) {
+  const response = await fetch(`http://127.0.0.1:${port}/_frpc/result`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-stackfrp-token": token },
+    body: JSON.stringify({ requestId, ...result })
+  });
+  assert.equal(response.status, 200);
+}
+
+test("Vercel gateway relays a request through an authenticated pull worker", async t => {
   const serviceId = "svc_testgateway";
   const token = "test-token";
   const gateway = createGateway({ serviceId, token, application: "demo" });
   const port = await listen(gateway.server);
-  t.after(() => gateway.close());
+  t.after(async () => {
+    await closeServer(gateway.server);
+    await gateway.close();
+  });
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/_frpc`);
-  await waitFor(socket, "open");
-  socket.send(encodeJson(register(serviceId, token, "demo")));
-
-  const registration = await nextFrame(socket, frame => frame.kind === "json");
-  assert.equal(registration.message.type, "registered");
+  const heartbeat = await pollOnce(port, token, 200);
+  assert.equal(heartbeat.type, "heartbeat");
+  assert.ok(heartbeat.instanceId);
 
   const health = await fetch(`http://127.0.0.1:${port}/_health`).then(r => r.json());
   assert.equal(health.tunnel, "connected");
+  assert.equal(health.mode, "pull");
 
   const verify = await fetch(`http://127.0.0.1:${port}/_verify`, {
     headers: { "x-stackfrp-token": token }
   }).then(r => r.json());
   assert.equal(verify.status, "verified");
 
-  const requestFramePromise = nextFrame(
-    socket,
-    frame => frame.kind === "json" && frame.message.type === "request"
-  );
-  const requestBodyPromise = nextFrame(
-    socket,
-    frame => frame.kind === "body" && frame.type === FRAME_REQUEST_BODY
-  );
   const pendingRequest = fetch(`http://127.0.0.1:${port}/hello`);
-  const request = await requestFramePromise;
-  const requestBody = await requestBodyPromise;
-  assert.equal(request.message.method, "GET");
-  assert.equal(request.message.path, "/hello");
-  assert.equal(requestBody.body.length, 0);
+  const request = await pollOnce(port, token);
+  assert.equal(request.type, "request");
+  assert.equal(request.method, "GET");
+  assert.equal(request.path, "/hello");
 
-  socket.send(encodeJson({
-    type: "response",
-    requestId: request.message.requestId,
+  await submit(port, token, request.requestId, {
     status: 201,
     headers: { "content-type": "text/plain" },
-    bodyLength: 5
-  }));
-  socket.send(encodeBody(FRAME_RESPONSE_BODY, request.message.requestId, Buffer.from("hello")));
+    body: Buffer.from("hello").toString("base64")
+  });
 
   const response = await pendingRequest;
   assert.equal(response.status, 201);
   assert.equal(await response.text(), "hello");
-
-  socket.terminate();
 });
 
 test("Vercel gateway shows the branded error page when the host is down", async t => {
   const gateway = createGateway({ serviceId: "svc_down", token: "token" });
   const port = await listen(gateway.server);
-  t.after(() => gateway.close());
+  t.after(async () => {
+    await closeServer(gateway.server);
+    await gateway.close();
+  });
 
   const response = await fetch(`http://127.0.0.1:${port}/app`);
   assert.equal(response.status, 522);
@@ -113,17 +87,17 @@ test("Vercel gateway shows the branded error page when the host is down", async 
   assert.match(html, /Frost-bit-star\/stackedge/);
 });
 
-test("Vercel gateway rejects invalid registration credentials", async t => {
+test("Vercel gateway rejects invalid pull credentials", async t => {
   const gateway = createGateway({ serviceId: "svc_auth", token: "correct" });
   const port = await listen(gateway.server);
-  t.after(() => gateway.close());
+  t.after(async () => {
+    await closeServer(gateway.server);
+    await gateway.close();
+  });
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/_frpc`);
-  await waitFor(socket, "open");
-  socket.send(encodeJson(register("svc_auth", "wrong", "demo")));
-
-  const reply = await nextFrame(socket, frame => frame.kind === "json");
-  assert.equal(reply.message.type, "error");
-  assert.equal(reply.message.code, "unauthorized");
-  socket.terminate();
+  const response = await fetch(`http://127.0.0.1:${port}/_frpc/poll?wait=200`, {
+    headers: { "x-stackfrp-token": "wrong" }
+  });
+  assert.equal(response.status, 401);
+  assert.equal((await response.json()).status, "unauthorized");
 });
