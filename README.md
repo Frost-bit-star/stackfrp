@@ -19,6 +19,8 @@ stackfrp gives a local Stackedge app a public URL without opening a port on the 
 
 The CLI and tunnel client live in [stackedge](https://github.com/Frost-bit-star/stackedge). This repo is the gateway that runs on Vercel or any long-lived Node host.
 
+The Vercel button imports this repo as a starter. It deploys the gateway code, but it is not a usable tunnel by itself: `config.json` is private and is not committed. Use the generated project from `stackedge vercel init`, or set the `STACKEDGE_FRPS_*` environment variables in your Vercel project.
+
 ## How it works
 
 ```text
