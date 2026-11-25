@@ -30,19 +30,40 @@ This project therefore exposes:
 
 Run `stackedge vercel probe <app>` on the user's machine after deployment. It reports `same-instance` only if a subsequent HTTP request sees the registered tunnel. Cross-instance routing means the deployment cannot transparently relay requests; run `server.js` on a long-lived Node runtime instead, or use a Vercel-supported persistent transport.
 
-## Environment variables
+## Error page
+
+The branded error page is built into `lib/error-page.js` from the supplied design. It is used for offline hosts, timeouts, oversized requests, bad configurations and other relay failures. It keeps the layout and shows "stackedge powered by frost-bit-star". Owners are directed to report issues or open pull requests at https://github.com/Frost-bit-star/stackedge.
+
+## Configuration
+
+A generated deployment includes `config.json`, written by `stackedge vercel init`, with the service ID and token. This lets Vercel Hobby deployments run without setting environment variables.
+
+```json
+{
+  "serviceId": "svc_...",
+  "token": "...",
+  "application": "myapp",
+  "protocol": 1,
+  "maxBodySize": 16777216
+}
+```
+
+Keep `config.json` private because it contains a live bearer token. Environment variables override it when needed:
 
 ```text
-STACKEDGE_FRPS_SERVICE_ID=<service id from stackedge vercel init>
-STACKEDGE_FRPS_TOKEN=<token from ~/.stackedge/vercel/<app>/credentials.json>
-STACKEDGE_FRPS_APP=<app name>
+STACKEDGE_FRPS_SERVICE_ID
+STACKEDGE_FRPS_TOKEN
+STACKEDGE_FRPS_APP
+STACKEDGE_FRPS_MAX_BODY_SIZE
 ```
 
 ## Local development
 
 ```sh
 npm install
-STACKEDGE_FRPS_SERVICE_ID=svc_... STACKEDGE_FRPS_TOKEN=... npm start
+cp config.example.json config.json
+# edit config.json, then:
+npm start
 ```
 
 `server.js` is the long-lived reference gateway; `api/gateway.js` is the Vercel entry point using the same `lib/frps` code.

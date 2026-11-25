@@ -99,6 +99,20 @@ test("Vercel gateway relays a request over an authenticated tunnel", async t => 
   socket.terminate();
 });
 
+test("Vercel gateway shows the branded error page when the host is down", async t => {
+  const gateway = createGateway({ serviceId: "svc_down", token: "token" });
+  const port = await listen(gateway.server);
+  t.after(() => gateway.close());
+
+  const response = await fetch(`http://127.0.0.1:${port}/app`);
+  assert.equal(response.status, 522);
+  assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
+  const html = await response.text();
+  assert.match(html, /Error 522/);
+  assert.match(html, /stackedge powered by frost-bit-star/);
+  assert.match(html, /Frost-bit-star\/stackedge/);
+});
+
 test("Vercel gateway rejects invalid registration credentials", async t => {
   const gateway = createGateway({ serviceId: "svc_auth", token: "correct" });
   const port = await listen(gateway.server);
