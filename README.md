@@ -119,12 +119,14 @@ cp config.example.json config.json
 
 ## Vercel behavior
 
-Vercel Functions are isolated. The tunnel lives in memory on the function instance that registered it. `stackedge vercel probe myapp` checks whether the next HTTP request reaches that same instance.
+`api/gateway.js` exports a Node HTTP server, so Vercel can upgrade `/_frpc` WebSockets with Fluid compute. New Vercel projects have Fluid compute enabled by default; older projects must enable it in Functions settings. `vercel.json` sets `maxDuration: 300`, which is the Hobby limit.
+
+A WebSocket connection stays pinned to the instance that accepted it, and FRPC reconnects when Vercel closes it. Public HTTP requests are not guaranteed to reach that same instance, so `stackedge vercel probe myapp` still matters:
 
 - `same-instance`: routing works.
-- `cross-instance`: public requests cannot reach the tunnel on Vercel.
+- `cross-instance`: public requests cannot reach the in-memory tunnel.
 
-For a permanent setup, run `server.js` on a long-lived Node host. It uses the same gateway code as Vercel.
+For guaranteed routing, run `server.js` on a long-lived Node host, or add a shared store so all instances can reach the tunnel state.
 
 ## Error page
 
